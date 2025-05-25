@@ -1,0 +1,184 @@
+// ——————————————————————————————————————————————
+// Pin definitions
+const int pinSensor   = 34;   // ADC input pin reading the PT100 voltage
+const int pinRele     = 26;   // GPIO pin driving the solid-state relay (SSR)
+
+// ——————————————————————————————————————————————
+// Temperature calculation constants
+const float Vcc            = 3.3;      // ADC reference voltage (V)
+const float coefPT100      = 0.3841;  // PT100 resistance coefficient (Ω/°C)
+const float offsetVoltage  = 0.0;      // Calibration offset applied to measured voltage (V)
+const float offsettemp     = 11.55;    // Calibration offset applied to computed temperature (°C)
+
+// ——————————————————————————————————————————————
+// Filtering parameters (trimmed-mean + exponential smoothing)
+const int   numSamples     = 60;       // Number of samples in the circular buffer
+float       tempBuffer[numSamples];    // Buffer to hold raw temperature samples
+int         sampleIndex    = 0;        // Current write index into tempBuffer
+float       smoothedTemp   = 0.0;      // Result of exponential smoothing
+const float alpha          = 0.2;      // Smoothing factor α (0 < α < 1)
+bool        firstCycle     = true;     // Flag: true only on very first smoothing iteration
+
+// ——————————————————————————————————————————————
+// Discrete-PI controller constants
+// Implements the difference equation:
+//   u(k) = –K1·e(k–1) + K2·e(k) + u(k–1)
+
+const float K2               = 12.05;    // Multiply current error e(k)
+const float K1               = 11.94;    // Multiply previous error e(k–1)
+const unsigned long controlPeriod = 5000; // Update interval for PI (ms)
+
+
+
+// ——————————————————————————————————————————————
+// PWM mapping & limits
+const float maxPower        = 1000.0;    // Max heater power capability (W)
+const float minDuty         = 0.01;      // Smallest allowed duty cycle (1%)
+const float maxDuty         = 0.95;       // Largest allowed duty cycle (95%)
+const unsigned long pwmPeriod = 1000;    // PWM period for SSR (ms)
+
+// ——————————————————————————————————————————————
+// Controller state variables
+float        setpoint         = 80.0;    // Desired temperature (°C)
+float        error_old        = 0.0;     // e(k–1): previous error
+float        control_old      = 0.0;     // u(k–1): previous control output (W)
+unsigned long lastControlTime = 0;       // Timestamp of last PI update
+float        dutyCycle        = 0.0;     // Current duty cycle fraction [0…1]
+
+// ——————————————————————————————————————————————
+// For printing telemetry
+float        lastVoltage      = 0.0;     // Most recent measured voltage (V)
+unsigned long lastPrintTime   = 0;       // Timestamp of last telemetry print (ms)
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(pinRele, OUTPUT);        // SSR control pin configured as output
+  digitalWrite(pinRele, LOW);      // Ensure SSR remains OFF at startup
+}
+
+void loop() {
+  unsigned long now = millis();    // Current time in milliseconds
+
+  // 1) Sample & filter temperature
+  //    - Reads ADC from PT100, converts to °C
+  //    - Stores in circular buffer
+  //    - Once buffer full, applies trimmed-mean and exponential smoothing
+  updateFilteredTemperature(now);
+
+  // 2) Discrete-PI update every controlPeriod (3 s)
+  if (now - lastControlTime >= controlPeriod) {
+    // a) Compute new error: e(k) = setpoint – current temperature
+    float error_new = setpoint - smoothedTemp;
+
+    // b) Difference equation:
+    //      u(k) = –K1·e(k–1) + K2·e(k) + u(k–1)
+    float control_new = -K1 * error_old + K2 * error_new + control_old;
+
+    // c) Clamp control output so it never exceeds what maxDuty allows:
+    //    constrain(x, low, high) returns:
+    //      - low   if x < low
+    //      - high  if x > high
+    //      - x     otherwise
+    //
+    // Here: high = maxPower * maxDuty  (e.g. 1000 W × 0.8 = 800 W)
+    control_new = constrain(control_new, maxPower * minDuty , maxPower * maxDuty);
+    // constrain(value to change, lower boundary, max boundary) => prevents a negative input and a power that 
+    // is higher than higher possible value.
+
+    // d) Convert from W to duty cycle fraction:
+    //      dutyCycle = control_new / maxPower
+    //    then clamp that fraction to [minDuty…maxDuty]:
+    dutyCycle = control_new / maxPower;
+    dutyCycle = constrain(dutyCycle, minDuty, maxDuty);
+
+    // e) Advance PI state for next iteration
+    control_old     = control_new;
+    error_old       = error_new;
+    lastControlTime = now;
+  }
+
+  // 3) Drive SSR with simple 1-second PWM based on dutyCycle
+  pwmDrive(now);
+
+  // 4) Print telemetry every 1 s (1000 ms)
+  if (now - lastPrintTime >= 1000) {
+    Serial.print("Time(s): ");      Serial.print(now / 1000.0, 2);
+    Serial.print(" | Voltage(V): ");Serial.print(lastVoltage, 4);
+    Serial.print(" | Temp(°C): ");  Serial.print(smoothedTemp, 2);
+    Serial.print(" | Error(°C): "); Serial.print(error_old, 2);
+    Serial.print(" | Power(W): ");  Serial.print(control_old, 1);
+    Serial.print(" | Duty(%): ");   Serial.print(dutyCycle * 100.0, 1);
+    Serial.println();
+
+    lastPrintTime = now;
+  }
+
+  // 5) Small delay (~16 ms) to sample ADC at ~60 Hz
+  delay(16);
+}
+
+// ——————————————————————————————————————————————
+// updateFilteredTemperature(now)
+//   • Reads the analog voltage from pinSensor (PT100).
+//   • Converts ADC count → voltage (Vpt100).
+//   • Converts voltage → temperature (°C) using PT100 formula + offset.
+//   • Inserts that temperature into a circular buffer.
+//   • Once buffer has numSamples entries:
+//       1) Copies & sorts the buffer.
+//       2) Computes a “trimmed‐mean” of the middle 10 values.
+//       3) Applies exponential smoothing (α parameter).
+//   • Updates globals smoothedTemp (filtered °C) and lastVoltage (V).
+void updateFilteredTemperature(unsigned long now) {
+  int adc      = analogRead(pinSensor);                   // 0–4095 (12-bit ADC)
+  float Vpt100 = (adc * Vcc / 4095.0) + offsetVoltage;    // Map to 0–Vcc
+  lastVoltage  = Vpt100;                                  // Store for telemetry
+
+  // PT100 conversion:
+  //  R_pt100 = 100·(Vpt100 / (Vcc − Vpt100))
+  //  Temp(°C) = (R_pt100 − 100) / coefPT100 + offsettemp
+  float ratio = (Vpt100 * 100.0) / (Vcc - Vpt100);
+  float tempC = (ratio - 100.0) / coefPT100 + offsettemp;
+
+  // Store sample in circular buffer
+  tempBuffer[sampleIndex++] = tempC;
+  if (sampleIndex < numSamples) return;  // Not enough samples yet
+  sampleIndex = 0;                       // Wrap around
+
+  // Copy & sort buffer for trimmed‐mean
+  float sorted[numSamples];
+  memcpy(sorted, tempBuffer, sizeof(tempBuffer));
+  for (int i = 0; i < numSamples - 1; i++) {
+    for (int j = 0; j < numSamples - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        float t = sorted[j];
+        sorted[j] = sorted[j + 1];
+        sorted[j + 1] = t;
+      }
+    }
+  }
+
+  // Compute trimmed-mean of middle 10 values (indices 25–34)
+  float sum = 0;
+  for (int i = 25; i < 35; i++) sum += sorted[i];
+  float trimmedAvg = sum / 10.0;
+
+  // Exponential smoothing:
+  //  smoothedTemp = α·trimmedAvg + (1 − α)·previous
+  if (firstCycle) {
+    smoothedTemp = trimmedAvg;
+    firstCycle   = false;
+  } else {
+    smoothedTemp = alpha * trimmedAvg + (1 - alpha) * smoothedTemp;
+  }
+}
+
+// ——————————————————————————————————————————————
+// pwmDrive(now)
+//   • Phase = (now modulo pwmPeriod) gives where we are in the 1-s cycle.
+//   • If phase < dutyCycle·pwmPeriod, SSR = HIGH (ON); otherwise LOW (OFF).
+//   • dutyCycle must already be clamped to [minDuty…maxDuty].
+void pwmDrive(unsigned long now) {
+  unsigned long phase = now % pwmPeriod;
+  bool on = (phase < (unsigned long)(pwmPeriod * dutyCycle));
+  digitalWrite(pinRele, on ? HIGH : LOW);
+}
