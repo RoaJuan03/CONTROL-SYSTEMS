@@ -1,0 +1,47 @@
+% PI calculated: kp = 14.7, ki = 0.0531
+% PI (PID tunner): kp = 11.99, ki = 0.02213
+
+
+% Función de transferencia continua (PID o PI)
+GG = tf([11.99 0.023612],[1 0])
+
+% Discretización con muestreo de 1 segundo, método Tustin (bilineal)
+Ts =5; % Tiempo de muestreo
+GD = c2d(GG, Ts, 'tustin');
+
+% Mostrar función de transferencia discreta
+disp('Transferencia discreta GD(z):');
+GD
+
+% Obtener coeficientes de numerador y denominador
+[num, den] = tfdata(GD, 'v');
+
+% Normalizar dividiendo todo por el coef. del denominador z^0 (den(1))
+num = num / den(1);
+den = den / den(1);
+
+% Mostrar la ecuación en diferencias
+fprintf('\nEcuación en diferencias (forma recursiva):\n');
+fprintf('u(k) = ');
+
+% Parte de salida (u)
+for i = 2:length(den)
+    coef = -den(i);
+    if coef >= 0
+        fprintf(' + %.4fu(k-%d)', coef, i-1);
+    else
+        fprintf(' %.4fu(k-%d)', coef, i-1);
+    end
+end
+
+% Parte de entrada (e)
+for i = 1:length(num)
+    coef = num(i);
+    if coef >= 0
+        fprintf(' + %.4fe(k-%d)', coef, i-1);
+    else
+        fprintf(' %.4fe(k-%d)', coef, i-1);
+    end
+end
+
+fprintf('\n');
